@@ -10,12 +10,6 @@ import (
 	"time"
 )
 
-type bucketListCheckerFunc func(context.Context, string) (bool, error)
-
-func (check bucketListCheckerFunc) IsListable(ctx context.Context, bucket string) (bool, error) {
-	return check(ctx, bucket)
-}
-
 func startTestResolver(t testing.TB) (*net.UDPConn, string, *sync.WaitGroup) {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -143,47 +137,6 @@ func TestResolverAddress(t *testing.T) {
 		if got := address.String(); got != want {
 			t.Errorf("resolverAddress(%q) = %q, want %q", input, got, want)
 		}
-	}
-}
-
-func TestRunnerFiltersForListableBuckets(t *testing.T) {
-	server, address, serverWG := startTestResolver(t)
-	defer func() {
-		_ = server.Close()
-		serverWG.Wait()
-	}()
-
-	var output bytes.Buffer
-	runner, err := newRunner(resolverConfig{
-		resolvers:   []string{address},
-		sockets:     1,
-		concurrency: 4,
-		timeout:     100 * time.Millisecond,
-		context:     context.Background(),
-		checker: bucketListCheckerFunc(func(_ context.Context, bucket string) (bool, error) {
-			return bucket == "exists", nil
-		}),
-		checkers: 2,
-	}, &output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runner.submit(context.Background(), "exists"); err != nil {
-		t.Fatal(err)
-	}
-	if err := runner.submit(context.Background(), "missing"); err != nil {
-		t.Fatal(err)
-	}
-	if err := runner.finish(); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := output.String(); got != "exists\n" {
-		t.Fatalf("output = %q, want %q", got, "exists\\n")
-	}
-	stats := runner.snapshot()
-	if stats.Checked != 2 || stats.Existing != 1 || stats.Found != 1 || stats.Errors != 0 {
-		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
 

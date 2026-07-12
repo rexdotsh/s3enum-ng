@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 type stringListFlag []string
 
@@ -45,11 +45,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	sockets := flags.Int("sockets", 4, "UDP sockets per resolver")
 	timeout := flags.Duration("timeout", 350*time.Millisecond, "DNS query timeout")
 	retries := flags.Int("retries", 3, "retries after a timeout")
+	httpMode := flags.Bool("http", false, "use HTTP HeadBucket instead of DNS")
 	listable := false
 	flags.BoolVar(&listable, "listable", false, "only print anonymously listable buckets (uses HTTP)")
 	flags.BoolVar(&listable, "check-public", false, "alias for -listable")
-	httpWorkers := flags.Int("http-workers", 32, "concurrent S3 listability checks")
-	httpTimeout := flags.Duration("http-timeout", 5*time.Second, "S3 listability request timeout")
+	httpWorkers := flags.Int("http-workers", 1024, "concurrent S3 HTTP checks")
+	httpTimeout := flags.Duration("http-timeout", 5*time.Second, "S3 HTTP request timeout")
 	showVersion := flags.Bool("version", false, "print version")
 	var resolvers stringListFlag
 	flags.Var(&resolvers, "resolver", "DNS resolver host[:port], repeatable or comma-separated")
@@ -62,9 +63,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	workersSet := false
+	httpWorkersSet := false
 	flags.Visit(func(current *flag.Flag) {
-		if current.Name == "workers" {
+		switch current.Name {
+		case "workers":
 			workersSet = true
+		case "http-workers":
+			httpWorkersSet = true
 		}
 	})
 	if *showVersion {
@@ -81,9 +86,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		*concurrency = *workers
+		if (*httpMode || listable) && !httpWorkersSet {
+			*httpWorkers = *workers
+		}
 	}
 	if *wordlist == "" || *suffixlist == "" || flags.NArg() == 0 {
 		flags.Usage()
+		return 2
+	}
+	if *httpMode && listable {
+		fmt.Fprintln(stderr, "-http and -listable select different output modes and cannot be combined")
 		return 2
 	}
 	if *concurrency <= 0 || *sockets <= 0 || *timeout <= 0 || *retries < 0 || *httpWorkers <= 0 || *httpTimeout <= 0 {
@@ -98,48 +110,75 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "read suffix list: %v\n", err)
 		return 1
 	}
-	if len(resolvers) == 0 {
-		resolvers, err = discoverAuthoritativeResolvers(ctx, strings.TrimSuffix(s3Suffix, "."))
-		if err != nil {
-			resolvers, err = loadSystemResolvers("/etc/resolv.conf")
+	var submit submitFunc
+	var finish func() error
+	var abort func() error
+	var snapshot func() stats
+	if *httpMode || listable {
+		checker := newS3ListChecker(*httpTimeout, *httpWorkers)
+		var probe httpProbeFunc
+		if *httpMode {
+			probe = func(ctx context.Context, candidate string) (bool, bool, error) {
+				exists, err := checker.ProbeExists(ctx, candidate)
+				return exists, exists, err
+			}
+			fmt.Fprintln(stderr, "warning: -http sends logged S3 HeadBucket requests for every candidate")
+		} else {
+			probe = func(ctx context.Context, candidate string) (bool, bool, error) {
+				exists, err := checker.ProbeExists(ctx, candidate)
+				if err != nil || !exists {
+					return exists, false, err
+				}
+				_, listable, err := checker.ProbeListing(ctx, candidate)
+				return true, listable, err
+			}
+			fmt.Fprintln(stderr, "warning: -listable sends logged HeadBucket requests for every candidate and ListObjectsV2 for hits")
+		}
+		httpScanner := newHTTPScanner(ctx, probe, *httpWorkers, stdout)
+		submit = httpScanner.submit
+		finish = httpScanner.finish
+		abort = httpScanner.finish
+		snapshot = httpScanner.snapshot
+	} else {
+		if len(resolvers) == 0 {
+			resolvers, err = discoverAuthoritativeResolvers(ctx, strings.TrimSuffix(s3Suffix, "."))
 			if err != nil {
-				fmt.Fprintln(stderr, err)
-				return 1
+				resolvers, err = loadSystemResolvers("/etc/resolv.conf")
+				if err != nil {
+					fmt.Fprintln(stderr, err)
+					return 1
+				}
 			}
 		}
-	}
 
-	var checker bucketListChecker
-	if listable {
-		checker = newS3ListChecker(*httpTimeout, *httpWorkers)
-		fmt.Fprintln(stderr, "warning: -listable sends HTTP requests that can be recorded in S3 access logs")
-	}
-	runner, err := newRunner(resolverConfig{
-		resolvers:   resolvers,
-		sockets:     *sockets,
-		concurrency: *concurrency,
-		timeout:     *timeout,
-		retries:     *retries,
-		context:     ctx,
-		checker:     checker,
-		checkers:    *httpWorkers,
-	}, stdout)
-	if err != nil {
-		fmt.Fprintf(stderr, "initialize DNS engine: %v\n", err)
-		return 1
+		runner, err := newRunner(resolverConfig{
+			resolvers:   resolvers,
+			sockets:     *sockets,
+			concurrency: *concurrency,
+			timeout:     *timeout,
+			retries:     *retries,
+		}, stdout)
+		if err != nil {
+			fmt.Fprintf(stderr, "initialize DNS engine: %v\n", err)
+			return 1
+		}
+		submit = runner.submit
+		finish = runner.finish
+		abort = runner.abort
+		snapshot = runner.snapshot
 	}
 
 	start := time.Now()
-	produceErr := produceCandidates(ctx, flags.Args(), *wordlist, suffixes, runner.submit)
+	produceErr := produceCandidates(ctx, flags.Args(), *wordlist, suffixes, submit)
 
 	var outputErr error
 	if ctx.Err() != nil {
-		outputErr = runner.abort()
+		outputErr = abort()
 	} else {
-		outputErr = runner.finish()
+		outputErr = finish()
 	}
 	duration := time.Since(start)
-	result := runner.snapshot()
+	result := snapshot()
 	qps := float64(result.Queries) / duration.Seconds()
 	if listable {
 		fmt.Fprintf(stderr, "checked: %d, found: %d, listable: %d, errors: %d, duration: %s, queries/sec: %.0f\n",

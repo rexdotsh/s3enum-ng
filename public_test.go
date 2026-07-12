@@ -76,3 +76,51 @@ func TestS3ListCheckerRetriesServerError(t *testing.T) {
 		t.Fatalf("listable=%v requests=%d", listable, requests.Load())
 	}
 }
+
+func TestS3HeadBucketExistenceStatuses(t *testing.T) {
+	statuses := map[string]int{
+		"public":       http.StatusOK,
+		"redirected":   http.StatusMovedPermanently,
+		"private":      http.StatusForbidden,
+		"missing":      http.StatusNotFound,
+		"invalid-name": http.StatusBadRequest,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodHead {
+			t.Errorf("method = %s, want HEAD", request.Method)
+		}
+		writer.WriteHeader(statuses[request.URL.Path[1:]])
+	}))
+	defer server.Close()
+
+	checker := newS3ListChecker(time.Second, 4)
+	checker.endpoint = server.URL
+	for bucket, status := range statuses {
+		exists, err := checker.ProbeExists(context.Background(), bucket)
+		if err != nil {
+			t.Fatalf("ProbeExists(%q): %v", bucket, err)
+		}
+		want := status == http.StatusOK || status == http.StatusMovedPermanently || status == http.StatusForbidden
+		if exists != want {
+			t.Errorf("ProbeExists(%q) = %v, want %v", bucket, exists, want)
+		}
+	}
+}
+
+func TestS3ListingClassifiesPrivateBucketAsExisting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("x-amz-bucket-region", "us-east-1")
+		writer.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	checker := newS3ListChecker(time.Second, 1)
+	checker.endpoint = server.URL
+	exists, listable, err := checker.ProbeListing(context.Background(), "private-bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || listable {
+		t.Fatalf("exists=%v listable=%v", exists, listable)
+	}
+}

@@ -22,9 +22,6 @@ type resolverConfig struct {
 	concurrency int
 	timeout     time.Duration
 	retries     int
-	context     context.Context
-	checker     bucketListChecker
-	checkers    int
 }
 
 type stats struct {
@@ -65,12 +62,6 @@ type runner struct {
 	outputMu  sync.Mutex
 	output    *bufio.Writer
 	outputErr error
-
-	checker         bucketListChecker
-	checkerContext  context.Context
-	checkerQueue    chan string
-	checkerWG       sync.WaitGroup
-	checkerStopOnce sync.Once
 }
 
 type dnsEngine struct {
@@ -96,22 +87,14 @@ func newRunner(config resolverConfig, output io.Writer) (*runner, error) {
 	if config.sockets <= 0 || config.concurrency <= 0 || config.timeout <= 0 || config.retries < 0 {
 		return nil, errors.New("invalid resolver configuration")
 	}
-	if config.checker != nil && config.checkers <= 0 {
-		return nil, errors.New("checker workers must be positive")
-	}
 	totalSockets := len(config.resolvers) * config.sockets
 	if config.concurrency > totalSockets*60000 {
 		return nil, fmt.Errorf("concurrency exceeds safe DNS transaction capacity (%d)", totalSockets*60000)
 	}
 
 	r := &runner{
-		sem:            make(chan struct{}, config.concurrency),
-		output:         bufio.NewWriterSize(output, 64*1024),
-		checker:        config.checker,
-		checkerContext: config.context,
-	}
-	if r.checkerContext == nil {
-		r.checkerContext = context.Background()
+		sem:    make(chan struct{}, config.concurrency),
+		output: bufio.NewWriterSize(output, 64*1024),
 	}
 	queueSize := config.concurrency/totalSockets + 64
 	for _, resolver := range config.resolvers {
@@ -127,13 +110,6 @@ func newRunner(config resolverConfig, output io.Writer) (*runner, error) {
 				return nil, fmt.Errorf("initialize resolver %s: %w", resolver, err)
 			}
 			r.engines = append(r.engines, engine)
-		}
-	}
-	if r.checker != nil {
-		r.checkerQueue = make(chan string, config.checkers*4)
-		r.checkerWG.Add(config.checkers)
-		for i := 0; i < config.checkers; i++ {
-			go r.checkerLoop()
 		}
 	}
 	return r, nil
@@ -173,12 +149,8 @@ func (r *runner) complete(req *request, found, failed bool) {
 	}
 	if found {
 		r.stats.existing.Add(1)
-		if r.checker != nil {
-			r.checkerQueue <- req.candidate
-		} else {
-			r.stats.found.Add(1)
-			r.emit(req.candidate)
-		}
+		r.stats.found.Add(1)
+		r.emit(req.candidate)
 	}
 	<-r.sem
 	r.wg.Done()
@@ -186,7 +158,6 @@ func (r *runner) complete(req *request, found, failed bool) {
 
 func (r *runner) finish() error {
 	r.wg.Wait()
-	r.stopCheckers()
 	r.stopEngines()
 	return r.flushOutput()
 }
@@ -194,33 +165,7 @@ func (r *runner) finish() error {
 func (r *runner) abort() error {
 	r.stopEngines()
 	r.wg.Wait()
-	r.stopCheckers()
 	return r.flushOutput()
-}
-
-func (r *runner) checkerLoop() {
-	defer r.checkerWG.Done()
-	for candidate := range r.checkerQueue {
-		listable, err := r.checker.IsListable(r.checkerContext, candidate)
-		if err != nil {
-			r.stats.errors.Add(1)
-			continue
-		}
-		if listable {
-			r.stats.found.Add(1)
-			r.emit(candidate)
-		}
-	}
-}
-
-func (r *runner) stopCheckers() {
-	if r.checker == nil {
-		return
-	}
-	r.checkerStopOnce.Do(func() {
-		close(r.checkerQueue)
-		r.checkerWG.Wait()
-	})
 }
 
 func (r *runner) emit(candidate string) {
