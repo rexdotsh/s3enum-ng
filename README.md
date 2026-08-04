@@ -22,6 +22,15 @@ go run github.com/rexdotsh/s3enum-ng@latest \
   example
 ```
 
+The repository includes starter lists from upstream s3enum. After cloning, run:
+
+```console
+go run . \
+  -wordlist examples/wordlist.txt \
+  -suffixlist examples/suffixlist.txt \
+  example
+```
+
 To build the local source:
 
 ```console
@@ -101,6 +110,8 @@ s3enum exactly.
 
 Existing s3enum commands using `-wordlist`, `-suffixlist`, `-workers`, and
 `-nameserver` are accepted unchanged.
+
+The files under `examples/` come from upstream s3enum and retain their ISC license.
 
 ## Output
 
