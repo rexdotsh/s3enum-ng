@@ -40,6 +40,7 @@ func TestS3ListCheckerRecognizesPublicListing(t *testing.T) {
 
 func TestS3ListCheckerRejectsAccessDenied(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("x-amz-bucket-region", "us-east-1")
 		writer.WriteHeader(http.StatusForbidden)
 	}))
 	defer server.Close()
@@ -79,17 +80,20 @@ func TestS3ListCheckerRetriesServerError(t *testing.T) {
 
 func TestS3HeadBucketExistenceStatuses(t *testing.T) {
 	statuses := map[string]int{
-		"public":       http.StatusOK,
-		"redirected":   http.StatusMovedPermanently,
-		"private":      http.StatusForbidden,
-		"missing":      http.StatusNotFound,
-		"invalid-name": http.StatusBadRequest,
+		"public":     http.StatusOK,
+		"redirected": http.StatusMovedPermanently,
+		"private":    http.StatusForbidden,
+		"missing":    http.StatusNotFound,
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodHead {
 			t.Errorf("method = %s, want HEAD", request.Method)
 		}
-		writer.WriteHeader(statuses[request.URL.Path[1:]])
+		status := statuses[request.URL.Path[1:]]
+		if status == http.StatusForbidden {
+			writer.Header().Set("x-amz-bucket-region", "us-east-1")
+		}
+		writer.WriteHeader(status)
 	}))
 	defer server.Close()
 
@@ -103,6 +107,71 @@ func TestS3HeadBucketExistenceStatuses(t *testing.T) {
 		want := status == http.StatusOK || status == http.StatusMovedPermanently || status == http.StatusForbidden
 		if exists != want {
 			t.Errorf("ProbeExists(%q) = %v, want %v", bucket, exists, want)
+		}
+	}
+}
+
+func TestS3HeadBucketRejectsInconclusiveForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	checker := newS3ListChecker(time.Second, 1)
+	checker.endpoint = server.URL
+	exists, err := checker.ProbeExists(context.Background(), "private-bucket")
+	if err == nil || exists {
+		t.Fatalf("exists=%v err=%v, want an inconclusive error", exists, err)
+	}
+	if checker.Requests() != 1 {
+		t.Fatalf("non-retryable response made %d requests", checker.Requests())
+	}
+}
+
+func TestS3HeadBucketUsesRegionAsPositiveEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("x-amz-bucket-region", "eu-west-1")
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	checker := newS3ListChecker(time.Second, 1)
+	checker.endpoint = server.URL
+	exists, err := checker.ProbeExists(context.Background(), "obscured-bucket")
+	if err != nil || !exists {
+		t.Fatalf("exists=%v err=%v", exists, err)
+	}
+}
+
+func TestS3HeadBucketRetriesThrottling(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) < 3 {
+			writer.Header().Set("Retry-After", "0")
+			writer.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	checker := newS3ListChecker(time.Second, 1)
+	checker.endpoint = server.URL
+	exists, err := checker.ProbeExists(context.Background(), "eventual-bucket")
+	if err != nil || exists || requests.Load() != 3 {
+		t.Fatalf("exists=%v err=%v requests=%d", exists, err, requests.Load())
+	}
+}
+
+func TestBucketCandidateValidation(t *testing.T) {
+	for _, candidate := range []string{"ab", "-bucket", "bucket-", "bucket/name", "bucket name"} {
+		if err := validateBucketCandidate(candidate); err == nil {
+			t.Errorf("validateBucketCandidate(%q) succeeded", candidate)
+		}
+	}
+	for _, candidate := range []string{"valid-bucket", "legacy_BUCKET", "bucket.example"} {
+		if err := validateBucketCandidate(candidate); err != nil {
+			t.Errorf("validateBucketCandidate(%q): %v", candidate, err)
 		}
 	}
 }

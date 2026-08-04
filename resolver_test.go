@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -120,6 +122,106 @@ func TestRunnerRetriesAndCountsFinalTimeout(t *testing.T) {
 	stats := runner.snapshot()
 	if stats.Checked != 1 || stats.Existing != 0 || stats.Found != 0 || stats.Errors != 1 || stats.Queries != 2 {
 		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestRunnerRetriesOnAnotherResolver(t *testing.T) {
+	silent, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+
+	server, address, serverWG := startTestResolver(t)
+	defer func() {
+		_ = server.Close()
+		serverWG.Wait()
+	}()
+
+	var output bytes.Buffer
+	runner, err := newRunner(resolverConfig{
+		resolvers:   []string{silent.LocalAddr().String(), address},
+		sockets:     1,
+		concurrency: 1,
+		timeout:     20 * time.Millisecond,
+		retries:     1,
+	}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.submit(context.Background(), "exists"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := output.String(); got != "exists\n" {
+		t.Fatalf("output = %q", got)
+	}
+	stats := runner.snapshot()
+	if stats.Queries != 2 || stats.Errors != 0 || stats.Found != 1 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestRunnerCancellationIsNotAnOperationalError(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runner, err := newRunner(resolverConfig{
+		context:     ctx,
+		resolvers:   []string{server.LocalAddr().String()},
+		sockets:     1,
+		concurrency: 1,
+		timeout:     time.Second,
+		retries:     1,
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.submit(ctx, "pending"); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := runner.abort(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := runner.snapshot()
+	if stats.Errors != 0 || stats.Canceled != 1 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestRunnerStopsOnOutputFailure(t *testing.T) {
+	server, address, serverWG := startTestResolver(t)
+	defer func() {
+		_ = server.Close()
+		serverWG.Wait()
+	}()
+
+	runner, err := newRunner(resolverConfig{
+		resolvers:   []string{address},
+		sockets:     1,
+		concurrency: 4,
+		timeout:     100 * time.Millisecond,
+	}, errorWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.submit(context.Background(), "exists"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.finish(); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("finish error = %v, want closed pipe", err)
+	}
+	if stats := runner.snapshot(); stats.Found != 0 {
+		t.Fatalf("failed output was counted as found: %+v", stats)
 	}
 }
 

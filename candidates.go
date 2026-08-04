@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -30,20 +31,14 @@ func readLines(path string) ([]string, error) {
 	return lines, nil
 }
 
-func produceCandidates(ctx context.Context, names []string, wordlist string, suffixes []string, submit submitFunc) error {
+func produceCandidates(ctx context.Context, names []string, words io.Reader, suffixes []string, submit submitFunc) error {
 	for _, name := range names {
 		if err := submit(ctx, name); err != nil {
 			return err
 		}
 	}
 
-	file, err := os.Open(wordlist)
-	if err != nil {
-		return fmt.Errorf("open wordlist: %w", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(words)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		word := scanner.Text()
@@ -76,7 +71,7 @@ func produceCandidates(ctx context.Context, names []string, wordlist string, suf
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read wordlist: %w", err)
+		return fmt.Errorf("read word list: %w", err)
 	}
 	return nil
 }

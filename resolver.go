@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,9 +16,15 @@ import (
 	"time"
 )
 
-var errRunnerStopped = errors.New("resolver stopped")
+var (
+	errRunnerStopped = errors.New("resolver stopped")
+	errDNSCapacity   = errors.New("DNS transaction capacity exhausted")
+)
+
+const maxErrorSamples = 5
 
 type resolverConfig struct {
+	context     context.Context
 	resolvers   []string
 	sockets     int
 	concurrency int
@@ -29,6 +37,7 @@ type stats struct {
 	Existing uint64
 	Found    uint64
 	Errors   uint64
+	Canceled uint64
 	Queries  uint64
 }
 
@@ -37,6 +46,7 @@ type counters struct {
 	existing atomic.Uint64
 	found    atomic.Uint64
 	errors   atomic.Uint64
+	canceled atomic.Uint64
 	queries  atomic.Uint64
 }
 
@@ -53,19 +63,26 @@ type pendingQuery struct {
 }
 
 type runner struct {
-	engines []*dnsEngine
-	sem     chan struct{}
-	wg      sync.WaitGroup
-	next    atomic.Uint64
-	stats   counters
+	context    context.Context
+	cancel     context.CancelFunc
+	engines    []*dnsEngine
+	sem        chan struct{}
+	wg         sync.WaitGroup
+	next       atomic.Uint64
+	stats      counters
+	dispatchMu sync.RWMutex
 
 	outputMu  sync.Mutex
 	output    *bufio.Writer
 	outputErr error
+
+	errorsMu     sync.Mutex
+	errorSamples []string
 }
 
 type dnsEngine struct {
 	runner   *runner
+	index    int
 	conn     *net.UDPConn
 	timeout  time.Duration
 	retries  int
@@ -88,36 +105,54 @@ func newRunner(config resolverConfig, output io.Writer) (*runner, error) {
 		return nil, errors.New("invalid resolver configuration")
 	}
 	totalSockets := len(config.resolvers) * config.sockets
+	if totalSockets > maxDNSEngines {
+		return nil, fmt.Errorf("DNS engine count exceeds limit (%d)", maxDNSEngines)
+	}
 	if config.concurrency > totalSockets*60000 {
 		return nil, fmt.Errorf("concurrency exceeds safe DNS transaction capacity (%d)", totalSockets*60000)
 	}
 
+	ctx := config.context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runnerCtx, cancel := context.WithCancel(ctx)
 	r := &runner{
-		sem:    make(chan struct{}, config.concurrency),
-		output: bufio.NewWriterSize(output, 64*1024),
+		context: runnerCtx,
+		cancel:  cancel,
+		sem:     make(chan struct{}, config.concurrency),
+		output:  bufio.NewWriterSize(output, 64*1024),
 	}
 	queueSize := config.concurrency/totalSockets + 64
 	for _, resolver := range config.resolvers {
 		address, err := resolverAddress(resolver)
 		if err != nil {
+			r.cancel()
 			r.stopEngines()
 			return nil, err
 		}
 		for i := 0; i < config.sockets; i++ {
-			engine, err := newDNSEngine(r, address, queueSize, config.timeout, config.retries)
+			engine, err := newDNSEngine(r, len(r.engines), address, queueSize, config.timeout, config.retries)
 			if err != nil {
+				r.cancel()
 				r.stopEngines()
 				return nil, fmt.Errorf("initialize resolver %s: %w", resolver, err)
 			}
 			r.engines = append(r.engines, engine)
 		}
 	}
+	go func() {
+		<-r.context.Done()
+		r.shutdownEngines()
+	}()
 	return r, nil
 }
 
 func (r *runner) submit(ctx context.Context, candidate string) error {
 	select {
 	case r.sem <- struct{}{}:
+	case <-r.context.Done():
+		return errRunnerStopped
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -125,10 +160,16 @@ func (r *runner) submit(ctx context.Context, candidate string) error {
 	req := &request{candidate: candidate}
 	r.wg.Add(1)
 	engine := r.engines[(r.next.Add(1)-1)%uint64(len(r.engines))]
+	r.dispatchMu.RLock()
+	defer r.dispatchMu.RUnlock()
 	select {
 	case engine.input <- req:
 		r.stats.checked.Add(1)
 		return nil
+	case <-r.context.Done():
+		<-r.sem
+		r.wg.Done()
+		return errRunnerStopped
 	case <-ctx.Done():
 		<-r.sem
 		r.wg.Done()
@@ -140,17 +181,21 @@ func (r *runner) submit(ctx context.Context, candidate string) error {
 	}
 }
 
-func (r *runner) complete(req *request, found, failed bool) {
+func (r *runner) complete(req *request, found bool, queryErr error, canceled bool) {
 	if !req.done.CompareAndSwap(false, true) {
 		return
 	}
-	if failed {
+	if canceled {
+		r.stats.canceled.Add(1)
+	} else if queryErr != nil {
 		r.stats.errors.Add(1)
+		r.recordError(req.candidate, queryErr)
 	}
 	if found {
 		r.stats.existing.Add(1)
-		r.stats.found.Add(1)
-		r.emit(req.candidate)
+		if r.emit(req.candidate) {
+			r.stats.found.Add(1)
+		}
 	}
 	<-r.sem
 	r.wg.Done()
@@ -158,33 +203,51 @@ func (r *runner) complete(req *request, found, failed bool) {
 
 func (r *runner) finish() error {
 	r.wg.Wait()
+	r.cancel()
 	r.stopEngines()
 	return r.flushOutput()
 }
 
 func (r *runner) abort() error {
+	r.cancel()
 	r.stopEngines()
 	r.wg.Wait()
 	return r.flushOutput()
 }
 
-func (r *runner) emit(candidate string) {
+func (r *runner) emit(candidate string) bool {
 	r.outputMu.Lock()
 	defer r.outputMu.Unlock()
 	if r.outputErr != nil {
-		return
+		return false
 	}
 	if _, err := fmt.Fprintln(r.output, candidate); err != nil {
 		r.outputErr = err
-		return
+		r.cancelScan()
+		return false
 	}
-	r.outputErr = r.output.Flush()
+	if err := r.output.Flush(); err != nil {
+		r.outputErr = err
+		r.cancelScan()
+		return false
+	}
+	return true
 }
 
-func (r *runner) stopEngines() {
+func (r *runner) cancelScan() {
+	r.cancel()
+}
+
+func (r *runner) shutdownEngines() {
+	r.dispatchMu.Lock()
+	defer r.dispatchMu.Unlock()
 	for _, engine := range r.engines {
 		engine.shutdown()
 	}
+}
+
+func (r *runner) stopEngines() {
+	r.shutdownEngines()
 	for _, engine := range r.engines {
 		engine.wg.Wait()
 	}
@@ -205,11 +268,26 @@ func (r *runner) snapshot() stats {
 		Existing: r.stats.existing.Load(),
 		Found:    r.stats.found.Load(),
 		Errors:   r.stats.errors.Load(),
+		Canceled: r.stats.canceled.Load(),
 		Queries:  r.stats.queries.Load(),
 	}
 }
 
-func newDNSEngine(r *runner, address *net.UDPAddr, queueSize int, timeout time.Duration, retries int) (*dnsEngine, error) {
+func (r *runner) recordError(candidate string, err error) {
+	r.errorsMu.Lock()
+	defer r.errorsMu.Unlock()
+	if len(r.errorSamples) < maxErrorSamples {
+		r.errorSamples = append(r.errorSamples, fmt.Sprintf("%q: %v", candidate, err))
+	}
+}
+
+func (r *runner) diagnostics() []string {
+	r.errorsMu.Lock()
+	defer r.errorsMu.Unlock()
+	return append([]string(nil), r.errorSamples...)
+}
+
+func newDNSEngine(r *runner, index int, address *net.UDPAddr, queueSize int, timeout time.Duration, retries int) (*dnsEngine, error) {
 	network := "udp4"
 	if address.IP.To4() == nil {
 		network = "udp6"
@@ -223,6 +301,7 @@ func newDNSEngine(r *runner, address *net.UDPAddr, queueSize int, timeout time.D
 
 	engine := &dnsEngine{
 		runner:  r,
+		index:   index,
 		conn:    conn,
 		timeout: timeout,
 		retries: retries,
@@ -261,13 +340,17 @@ func (e *dnsEngine) sendLoop() {
 func (e *dnsEngine) send(req *request) {
 	id, pending, ok := e.reserve(req)
 	if !ok {
-		e.runner.complete(req, false, true)
+		if e.runner.context.Err() != nil {
+			e.runner.complete(req, false, nil, true)
+		} else {
+			e.runner.complete(req, false, errDNSCapacity, false)
+		}
 		return
 	}
 	message, question, err := buildQuery(req.candidate, id)
 	if err != nil {
 		e.remove(id, pending)
-		e.runner.complete(req, false, true)
+		e.runner.complete(req, false, err, false)
 		return
 	}
 	if !e.setQuestion(id, pending, question) {
@@ -278,7 +361,10 @@ func (e *dnsEngine) send(req *request) {
 	written, err := e.conn.Write(message)
 	if err != nil || written != len(message) {
 		if e.remove(id, pending) {
-			e.runner.complete(req, false, true)
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+			e.runner.retryRequest(e, req, fmt.Errorf("send DNS query: %w", err))
 		}
 	}
 }
@@ -294,6 +380,13 @@ func (e *dnsEngine) setQuestion(id uint16, expected *pendingQuery, question stri
 }
 
 func (e *dnsEngine) reserve(req *request) (uint16, *pendingQuery, bool) {
+	var random [2]byte
+	_, randomErr := cryptorand.Read(random[:])
+	start := e.nextID
+	if randomErr == nil {
+		start = binary.BigEndian.Uint16(random[:])
+	}
+
 	e.pendingMu.Lock()
 	defer e.pendingMu.Unlock()
 	select {
@@ -303,9 +396,9 @@ func (e *dnsEngine) reserve(req *request) (uint16, *pendingQuery, bool) {
 	}
 
 	for i := 0; i < len(e.pending); i++ {
-		id := e.nextID
-		e.nextID++
+		id := start + uint16(i)
 		if e.pending[id] == nil {
+			e.nextID = id + 1
 			pending := &pendingQuery{
 				request:  req,
 				deadline: time.Now().Add(e.timeout).UnixNano(),
@@ -344,7 +437,11 @@ func (e *dnsEngine) receiveLoop() {
 		}
 		e.pendingMu.Unlock()
 		if pending != nil {
-			e.runner.complete(pending.request, found, responseErr != nil)
+			if responseErr != nil {
+				e.runner.retryRequest(e, pending.request, responseErr)
+			} else {
+				e.runner.complete(pending.request, found, nil, false)
+			}
 		}
 	}
 }
@@ -383,17 +480,40 @@ func (e *dnsEngine) expire(now int64) {
 	e.pendingMu.Unlock()
 
 	for _, req := range expired {
-		if req.attempt < e.retries {
-			req.attempt++
-			select {
-			case e.retry <- req:
-			case <-e.stop:
-				e.runner.complete(req, false, true)
-			}
-		} else {
-			e.runner.complete(req, false, true)
+		e.runner.retryRequest(e, req, errors.New("DNS query timed out"))
+	}
+}
+
+func (r *runner) retryRequest(from *dnsEngine, req *request, cause error) {
+	if r.context.Err() != nil {
+		r.complete(req, false, nil, true)
+		return
+	}
+	if req.attempt >= from.retries {
+		r.complete(req, false, fmt.Errorf("%w after %d attempt(s)", cause, req.attempt+1), false)
+		return
+	}
+	req.attempt++
+
+	r.dispatchMu.RLock()
+	defer r.dispatchMu.RUnlock()
+	start := (from.index + req.attempt) % len(r.engines)
+	for offset := 0; offset < len(r.engines); offset++ {
+		target := r.engines[(start+offset)%len(r.engines)]
+		if len(r.engines) > 1 && target == from {
+			continue
+		}
+		select {
+		case target.retry <- req:
+			return
+		case <-target.stop:
+			continue
+		case <-r.context.Done():
+			r.complete(req, false, nil, true)
+			return
 		}
 	}
+	r.complete(req, false, errRunnerStopped, r.context.Err() != nil)
 }
 
 func (e *dnsEngine) remove(id uint16, expected *pendingQuery) bool {
@@ -425,7 +545,7 @@ func (e *dnsEngine) failPending() {
 	}
 	e.pendingMu.Unlock()
 	for _, req := range requests {
-		e.runner.complete(req, false, true)
+		e.runner.complete(req, false, nil, true)
 	}
 }
 
@@ -433,9 +553,9 @@ func (e *dnsEngine) drainQueues() {
 	for {
 		select {
 		case req := <-e.retry:
-			e.runner.complete(req, false, true)
+			e.runner.complete(req, false, nil, true)
 		case req := <-e.input:
-			e.runner.complete(req, false, true)
+			e.runner.complete(req, false, nil, true)
 		default:
 			return
 		}

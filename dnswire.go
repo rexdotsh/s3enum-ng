@@ -69,7 +69,7 @@ func parseResponse(message []byte) (id uint16, question string, found bool, err 
 	}
 	id = binary.BigEndian.Uint16(message[0:2])
 	flags := binary.BigEndian.Uint16(message[2:4])
-	if flags&0x8000 == 0 {
+	if flags&0x8000 == 0 || flags&0x7800 != 0 {
 		return id, "", false, errMalformedResponse
 	}
 	if flags&0x0200 != 0 {
@@ -78,37 +78,35 @@ func parseResponse(message []byte) (id uint16, question string, found bool, err 
 
 	questionCount := int(binary.BigEndian.Uint16(message[4:6]))
 	answerCount := int(binary.BigEndian.Uint16(message[6:8]))
-	if questionCount == 0 {
+	if questionCount != 1 {
 		return id, "", false, errMalformedResponse
 	}
 
 	offset := dnsHeaderLen
-	for i := 0; i < questionCount; i++ {
-		name, next, decodeErr := decodeName(message, offset)
-		if decodeErr != nil || next+4 > len(message) {
-			return id, "", false, errMalformedResponse
-		}
-		if i == 0 {
-			question = name
-			if binary.BigEndian.Uint16(message[next:next+2]) != dnsTypeCNAME ||
-				binary.BigEndian.Uint16(message[next+2:next+4]) != dnsClassIN {
-				return id, question, false, errMalformedResponse
-			}
-		}
-		offset = next + 4
+	name, next, decodeErr := decodeName(message, offset)
+	if decodeErr != nil || next+4 > len(message) {
+		return id, "", false, errMalformedResponse
 	}
+	question = name
+	if binary.BigEndian.Uint16(message[next:next+2]) != dnsTypeCNAME ||
+		binary.BigEndian.Uint16(message[next+2:next+4]) != dnsClassIN {
+		return id, question, false, errMalformedResponse
+	}
+	offset = next + 4
 
 	rcode := flags & 0x000f
 	if rcode != 0 && rcode != 3 {
 		return id, question, false, fmt.Errorf("DNS response code %d", rcode)
 	}
 
+	currentName := question
 	for i := 0; i < answerCount; i++ {
-		_, next, decodeErr := decodeName(message, offset)
+		owner, next, decodeErr := decodeName(message, offset)
 		if decodeErr != nil || next+10 > len(message) {
 			return id, question, false, errMalformedResponse
 		}
 		recordType := binary.BigEndian.Uint16(message[next : next+2])
+		recordClass := binary.BigEndian.Uint16(message[next+2 : next+4])
 		rdataLength := int(binary.BigEndian.Uint16(message[next+8 : next+10]))
 		rdataStart := next + 10
 		rdataEnd := rdataStart + rdataLength
@@ -117,12 +115,16 @@ func parseResponse(message []byte) (id uint16, question string, found bool, err 
 		}
 
 		if recordType == dnsTypeCNAME {
-			target, consumed, decodeErr := decodeName(message, rdataStart)
-			if decodeErr != nil || consumed > rdataEnd {
+			if recordClass != dnsClassIN {
 				return id, question, false, errMalformedResponse
 			}
-			if !strings.EqualFold(target, nonexistentTarget) {
-				found = true
+			target, consumed, decodeErr := decodeName(message, rdataStart)
+			if decodeErr != nil || consumed != rdataEnd {
+				return id, question, false, errMalformedResponse
+			}
+			if strings.EqualFold(owner, currentName) {
+				currentName = target
+				found = !strings.EqualFold(target, nonexistentTarget)
 			}
 		}
 		offset = rdataEnd

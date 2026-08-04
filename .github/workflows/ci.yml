@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - 1.25.x
+          - 1.26.x
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache: false
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l *.go)"
+          test -z "$unformatted" || { printf '%s\n' "$unformatted"; exit 1; }
+      - name: Check module metadata
+        run: go mod tidy -diff
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -shuffle=on -coverprofile=coverage.out ./...
+      - name: Race detector
+        if: matrix.go == '1.26.x'
+        run: go test -race ./...
+      - name: Build
+        run: go build -trimpath ./...
+
+  analyze:
+    name: Static and vulnerability analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.x
+          check-latest: true
+          cache: false
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          "$(go env GOPATH)/bin/staticcheck" ./...
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  cross-build:
+    name: Cross-platform build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.x
+          check-latest: true
+          cache: false
+      - name: Build release targets
+        run: |
+          GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/s3enum-ng-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -trimpath -o /tmp/s3enum-ng-linux-arm64 .
+          GOOS=darwin GOARCH=amd64 go build -trimpath -o /tmp/s3enum-ng-darwin-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -trimpath -o /tmp/s3enum-ng-darwin-arm64 .
+          GOOS=windows GOARCH=amd64 go build -trimpath -o /tmp/s3enum-ng-windows-amd64.exe .
+          GOOS=windows GOARCH=arm64 go build -trimpath -o /tmp/s3enum-ng-windows-arm64.exe .

@@ -8,12 +8,20 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 )
 
-var version = "0.3.0"
+const (
+	defaultHTTPWorkers = 1024
+	maxHTTPWorkers     = 4096
+	maxDNSSockets      = 64
+	maxDNSEngines      = 256
+)
+
+var version = "devel"
 
 type stringListFlag []string
 
@@ -49,7 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	listable := false
 	flags.BoolVar(&listable, "listable", false, "only print anonymously listable buckets (uses HTTP)")
 	flags.BoolVar(&listable, "check-public", false, "alias for -listable")
-	httpWorkers := flags.Int("http-workers", 1024, "concurrent S3 HTTP checks")
+	httpWorkers := flags.Int("http-workers", defaultHTTPWorkers, "concurrent S3 HTTP checks")
 	httpTimeout := flags.Duration("http-timeout", 5*time.Second, "S3 HTTP request timeout")
 	showVersion := flags.Bool("version", false, "print version")
 	var resolvers stringListFlag
@@ -60,6 +68,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	workersSet := false
@@ -73,11 +84,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	})
 	if *showVersion {
-		if strings.HasPrefix(version, "v") {
-			fmt.Fprintln(stdout, version)
-		} else {
-			fmt.Fprintln(stdout, "v"+version)
-		}
+		fmt.Fprintln(stdout, currentVersion())
 		return 0
 	}
 	if workersSet {
@@ -98,22 +105,38 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "-http and -listable select different output modes and cannot be combined")
 		return 2
 	}
-	if *concurrency <= 0 || *sockets <= 0 || *timeout <= 0 || *retries < 0 || *httpWorkers <= 0 || *httpTimeout <= 0 {
-		fmt.Fprintln(stderr, "concurrency, sockets, timeouts, and HTTP workers must be positive; retries cannot be negative")
-		return 2
+	if *httpMode || listable {
+		if *httpWorkers <= 0 || *httpWorkers > maxHTTPWorkers || *httpTimeout <= 0 {
+			fmt.Fprintf(stderr, "HTTP workers must be between 1 and %d and HTTP timeout must be positive\n", maxHTTPWorkers)
+			return 2
+		}
+	} else {
+		if *concurrency <= 0 || *sockets <= 0 || *sockets > maxDNSSockets || *timeout <= 0 || *retries < 0 || len(resolvers)*(*sockets) > maxDNSEngines {
+			fmt.Fprintf(stderr, "concurrency and DNS timeout must be positive, sockets must be between 1 and %d, total DNS engines cannot exceed %d, and retries cannot be negative\n", maxDNSSockets, maxDNSEngines)
+			return 2
+		}
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	suffixes, err := readLines(*suffixlist)
 	if err != nil {
 		fmt.Fprintf(stderr, "read suffix list: %v\n", err)
 		return 1
 	}
+	words, err := os.Open(*wordlist)
+	if err != nil {
+		fmt.Fprintf(stderr, "open word list: %v\n", err)
+		return 1
+	}
+	defer words.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	var submit submitFunc
 	var finish func() error
 	var abort func() error
 	var snapshot func() stats
+	var diagnostics func() []string
 	if *httpMode || listable {
 		checker := newS3ListChecker(*httpTimeout, *httpWorkers)
 		var probe httpProbeFunc
@@ -136,13 +159,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		httpScanner := newHTTPScanner(ctx, probe, *httpWorkers, stdout)
 		submit = httpScanner.submit
-		finish = httpScanner.finish
-		abort = httpScanner.finish
-		snapshot = httpScanner.snapshot
+		finish = func() error {
+			defer checker.Close()
+			return httpScanner.finish()
+		}
+		abort = finish
+		snapshot = func() stats {
+			result := httpScanner.snapshot()
+			result.Queries = checker.Requests()
+			return result
+		}
+		diagnostics = httpScanner.diagnostics
 	} else {
 		if len(resolvers) == 0 {
 			resolvers, err = discoverAuthoritativeResolvers(ctx, strings.TrimSuffix(s3Suffix, "."))
 			if err != nil {
+				fmt.Fprintf(stderr, "warning: authoritative resolver discovery failed (%v); using system resolvers\n", err)
 				resolvers, err = loadSystemResolvers("/etc/resolv.conf")
 				if err != nil {
 					fmt.Fprintln(stderr, err)
@@ -152,6 +184,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 
 		runner, err := newRunner(resolverConfig{
+			context:     ctx,
 			resolvers:   resolvers,
 			sockets:     *sockets,
 			concurrency: *concurrency,
@@ -166,10 +199,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		finish = runner.finish
 		abort = runner.abort
 		snapshot = runner.snapshot
+		diagnostics = runner.diagnostics
 	}
 
 	start := time.Now()
-	produceErr := produceCandidates(ctx, flags.Args(), *wordlist, suffixes, submit)
+	produceErr := produceCandidates(ctx, flags.Args(), words, suffixes, submit)
 
 	var outputErr error
 	if ctx.Err() != nil {
@@ -179,13 +213,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	duration := time.Since(start)
 	result := snapshot()
-	qps := float64(result.Queries) / duration.Seconds()
+	rate := float64(result.Queries) / max(duration.Seconds(), 0.001)
 	if listable {
-		fmt.Fprintf(stderr, "checked: %d, found: %d, listable: %d, errors: %d, duration: %s, queries/sec: %.0f\n",
-			result.Checked, result.Existing, result.Found, result.Errors, duration.Round(time.Millisecond), qps)
+		fmt.Fprintf(stderr, "checked: %d, existing: %d, listable: %d, errors: %d, canceled: %d, requests: %d, duration: %s, requests/sec: %.0f\n",
+			result.Checked, result.Existing, result.Found, result.Errors, result.Canceled, result.Queries, duration.Round(time.Millisecond), rate)
+	} else if *httpMode {
+		fmt.Fprintf(stderr, "checked: %d, found: %d, errors: %d, canceled: %d, requests: %d, duration: %s, requests/sec: %.0f\n",
+			result.Checked, result.Found, result.Errors, result.Canceled, result.Queries, duration.Round(time.Millisecond), rate)
 	} else {
-		fmt.Fprintf(stderr, "checked: %d, found: %d, errors: %d, duration: %s, queries/sec: %.0f\n",
-			result.Checked, result.Found, result.Errors, duration.Round(time.Millisecond), qps)
+		fmt.Fprintf(stderr, "checked: %d, found: %d, errors: %d, canceled: %d, packets: %d, duration: %s, packets/sec: %.0f\n",
+			result.Checked, result.Found, result.Errors, result.Canceled, result.Queries, duration.Round(time.Millisecond), rate)
+	}
+	for _, diagnostic := range diagnostics() {
+		fmt.Fprintf(stderr, "error: %s\n", diagnostic)
 	}
 
 	if outputErr != nil {
@@ -199,5 +239,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if ctx.Err() != nil {
 		return 130
 	}
+	if result.Errors > 0 {
+		return 1
+	}
 	return 0
+}
+
+func currentVersion() string {
+	value := version
+	if value == "devel" {
+		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			value = info.Main.Version
+		}
+	}
+	if value == "devel" || strings.HasPrefix(value, "v") {
+		return value
+	}
+	return "v" + value
 }

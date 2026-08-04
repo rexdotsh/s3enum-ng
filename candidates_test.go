@@ -2,21 +2,14 @@ package main
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
 func TestProduceCandidatesMatchesS3enum(t *testing.T) {
-	dir := t.TempDir()
-	wordlist := filepath.Join(dir, "words.txt")
-	if err := os.WriteFile(wordlist, []byte("bar\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	var got []string
-	err := produceCandidates(context.Background(), []string{"foo"}, wordlist, []string{"baz"},
+	err := produceCandidates(context.Background(), []string{"foo"}, strings.NewReader("bar\n"), []string{"baz"},
 		func(_ context.Context, candidate string) error {
 			got = append(got, candidate)
 			return nil
@@ -38,14 +31,8 @@ func TestProduceCandidatesMatchesS3enum(t *testing.T) {
 }
 
 func TestProduceCandidatesKeepsDuplicates(t *testing.T) {
-	dir := t.TempDir()
-	wordlist := filepath.Join(dir, "words.txt")
-	if err := os.WriteFile(wordlist, []byte("same\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	count := 0
-	err := produceCandidates(context.Background(), []string{"same"}, wordlist, nil,
+	err := produceCandidates(context.Background(), []string{"same"}, strings.NewReader("same\n"), nil,
 		func(_ context.Context, _ string) error {
 			count++
 			return nil

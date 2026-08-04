@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -12,6 +13,7 @@ type httpProbeFunc func(context.Context, string) (exists, selected bool, err err
 
 type httpScanner struct {
 	context context.Context
+	cancel  context.CancelFunc
 	probe   httpProbeFunc
 	queue   chan string
 	jobs    sync.WaitGroup
@@ -21,11 +23,16 @@ type httpScanner struct {
 	outputMu  sync.Mutex
 	output    *bufio.Writer
 	outputErr error
+
+	errorsMu     sync.Mutex
+	errorSamples []string
 }
 
 func newHTTPScanner(ctx context.Context, probe httpProbeFunc, workers int, output io.Writer) *httpScanner {
+	scannerCtx, cancel := context.WithCancel(ctx)
 	scanner := &httpScanner{
-		context: ctx,
+		context: scannerCtx,
+		cancel:  cancel,
 		probe:   probe,
 		queue:   make(chan string, workers*4),
 		output:  bufio.NewWriterSize(output, 64*1024),
@@ -42,8 +49,10 @@ func (scanner *httpScanner) submit(ctx context.Context, candidate string) error 
 	select {
 	case scanner.queue <- candidate:
 		scanner.stats.checked.Add(1)
-		scanner.stats.queries.Add(1)
 		return nil
+	case <-scanner.context.Done():
+		scanner.jobs.Done()
+		return scanner.context.Err()
 	case <-ctx.Done():
 		scanner.jobs.Done()
 		return ctx.Err()
@@ -53,21 +62,32 @@ func (scanner *httpScanner) submit(ctx context.Context, candidate string) error 
 func (scanner *httpScanner) worker() {
 	defer scanner.workers.Done()
 	for candidate := range scanner.queue {
+		select {
+		case <-scanner.context.Done():
+			scanner.stats.canceled.Add(1)
+			scanner.jobs.Done()
+			continue
+		default:
+		}
+
 		exists, selected, err := scanner.probe(scanner.context, candidate)
 		if exists {
 			scanner.stats.existing.Add(1)
 		}
-		if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && scanner.context.Err() != nil {
+			scanner.stats.canceled.Add(1)
+		} else if err != nil {
 			scanner.stats.errors.Add(1)
-		} else if selected {
+			scanner.recordError(candidate, err)
+		} else if selected && scanner.emit(candidate) {
 			scanner.stats.found.Add(1)
-			scanner.emit(candidate)
 		}
 		scanner.jobs.Done()
 	}
 }
 
 func (scanner *httpScanner) finish() error {
+	defer scanner.cancel()
 	scanner.jobs.Wait()
 	close(scanner.queue)
 	scanner.workers.Wait()
@@ -79,17 +99,23 @@ func (scanner *httpScanner) finish() error {
 	return scanner.outputErr
 }
 
-func (scanner *httpScanner) emit(candidate string) {
+func (scanner *httpScanner) emit(candidate string) bool {
 	scanner.outputMu.Lock()
 	defer scanner.outputMu.Unlock()
 	if scanner.outputErr != nil {
-		return
+		return false
 	}
 	if _, err := fmt.Fprintln(scanner.output, candidate); err != nil {
 		scanner.outputErr = err
-		return
+		scanner.cancel()
+		return false
 	}
-	scanner.outputErr = scanner.output.Flush()
+	if err := scanner.output.Flush(); err != nil {
+		scanner.outputErr = err
+		scanner.cancel()
+		return false
+	}
+	return true
 }
 
 func (scanner *httpScanner) snapshot() stats {
@@ -98,6 +124,20 @@ func (scanner *httpScanner) snapshot() stats {
 		Existing: scanner.stats.existing.Load(),
 		Found:    scanner.stats.found.Load(),
 		Errors:   scanner.stats.errors.Load(),
-		Queries:  scanner.stats.queries.Load(),
+		Canceled: scanner.stats.canceled.Load(),
 	}
+}
+
+func (scanner *httpScanner) recordError(candidate string, err error) {
+	scanner.errorsMu.Lock()
+	defer scanner.errorsMu.Unlock()
+	if len(scanner.errorSamples) < maxErrorSamples {
+		scanner.errorSamples = append(scanner.errorSamples, fmt.Sprintf("%q: %v", candidate, err))
+	}
+}
+
+func (scanner *httpScanner) diagnostics() []string {
+	scanner.errorsMu.Lock()
+	defer scanner.errorsMu.Unlock()
+	return append([]string(nil), scanner.errorSamples...)
 }

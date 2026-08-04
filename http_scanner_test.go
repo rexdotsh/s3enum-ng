@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"sync/atomic"
 	"testing"
 )
 
@@ -36,7 +38,37 @@ func TestHTTPScannerFiltersAndCountsResults(t *testing.T) {
 		t.Fatalf("output = %q, want %q", got, "public\\n")
 	}
 	stats := scanner.snapshot()
-	if stats.Checked != 4 || stats.Existing != 3 || stats.Found != 1 || stats.Errors != 1 || stats.Queries != 4 {
+	if stats.Checked != 4 || stats.Existing != 3 || stats.Found != 1 || stats.Errors != 1 || stats.Canceled != 0 {
 		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) {
+	return 0, io.ErrClosedPipe
+}
+
+func TestHTTPScannerCancelsOnOutputFailure(t *testing.T) {
+	var probes atomic.Int32
+	probe := func(_ context.Context, _ string) (bool, bool, error) {
+		probes.Add(1)
+		return true, true, nil
+	}
+
+	scanner := newHTTPScanner(context.Background(), probe, 2, errorWriter{})
+	for i := 0; i < 100; i++ {
+		if err := scanner.submit(context.Background(), "candidate"); err != nil {
+			break
+		}
+	}
+	if err := scanner.finish(); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("finish error = %v, want closed pipe", err)
+	}
+	if got := probes.Load(); got >= 100 {
+		t.Fatalf("output failure did not stop probes: got %d", got)
+	}
+	if stats := scanner.snapshot(); stats.Canceled == 0 {
+		t.Fatalf("expected canceled work, stats: %+v", stats)
 	}
 }

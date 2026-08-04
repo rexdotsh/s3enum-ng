@@ -1,1 +1,4 @@
 /s3enum-ng
+/dist/
+/coverage.out
+*.test
